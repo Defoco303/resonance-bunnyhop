@@ -155,4 +155,4 @@ Windows 向けのコントローラ入力補助ツールです。
 
 ## ライセンス
 
-このリポジトリは `MIT License` です。詳細は [LICENSE]を参照してください。
+このリポジトリは `MIT License` です。詳細は [LICENSE](https://github.com/Defoco303/resonance-bunnyhop/blob/main/LICENSE.md)を参照してください。

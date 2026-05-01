@@ -1,8 +1,8 @@
 use std::{thread, time::Duration};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use hidapi::{DeviceInfo, HidApi, HidDevice, MAX_REPORT_DESCRIPTOR_SIZE};
-use hidparser::{ReportField, VariableField, parse_report_descriptor};
+use hidparser::{parse_report_descriptor, ReportField, VariableField};
 
 use crate::assist::{Buttons, ControllerState, DpadDirection, StickState};
 
@@ -116,7 +116,10 @@ impl InputDeviceInfo {
                 .manufacturer_string()
                 .unwrap_or("Unknown manufacturer")
                 .to_owned(),
-            product: info.product_string().unwrap_or("Unknown product").to_owned(),
+            product: info
+                .product_string()
+                .unwrap_or("Unknown product")
+                .to_owned(),
             backend: backend_for(info),
             connection_mode: connection_mode_for(info),
         }
@@ -135,9 +138,7 @@ impl InputDeviceInfo {
 
     pub fn product_label(&self) -> String {
         match self.backend {
-            Some(backend)
-                if !backend.is_generic() && self.product.contains(backend.label()) =>
-            {
+            Some(backend) if !backend.is_generic() && self.product.contains(backend.label()) => {
                 self.product.clone()
             }
             Some(backend) if !backend.is_generic() => backend.label().to_owned(),
@@ -153,7 +154,12 @@ impl InputDeviceInfo {
 
 #[derive(Clone, Debug)]
 pub enum InputParser {
-    SonyDualSense { connection_mode: ConnectionMode },
+    SonyDualSense {
+        connection_mode: ConnectionMode,
+    },
+    SonyDualShock4 {
+        connection_mode: ConnectionMode,
+    },
     NintendoSwitch {
         connection_mode: ConnectionMode,
         generic: GenericHidParser,
@@ -166,6 +172,9 @@ impl InputParser {
         match self {
             Self::SonyDualSense { connection_mode } => {
                 parse_dualsense_input_report(*connection_mode, report)
+            }
+            Self::SonyDualShock4 { connection_mode } => {
+                parse_dualshock4_input_report(*connection_mode, report)
             }
             Self::NintendoSwitch {
                 connection_mode,
@@ -224,7 +233,10 @@ fn should_ignore_hid_device(info: &DeviceInfo) -> bool {
         .manufacturer_string()
         .unwrap_or_default()
         .to_ascii_uppercase();
-    let product = info.product_string().unwrap_or_default().to_ascii_uppercase();
+    let product = info
+        .product_string()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
 
     path.contains("IG_")
         && (manufacturer.contains("MICROSOFT")
@@ -282,7 +294,8 @@ fn should_list(info: &DeviceInfo) -> bool {
         return false;
     }
 
-    info.vendor_id() == SONY_VENDOR_ID || (info.usage_page() == 0x01 && matches!(info.usage(), 0x04 | 0x05))
+    info.vendor_id() == SONY_VENDOR_ID
+        || (info.usage_page() == 0x01 && matches!(info.usage(), 0x04 | 0x05))
 }
 
 fn input_priority(info: &InputDeviceInfo) -> (bool, u8, bool, bool, bool) {
@@ -452,14 +465,14 @@ fn build_input_parser(device: &HidDevice, info: &InputDeviceInfo) -> Result<Inpu
         InputBackend::DualSense | InputBackend::DualSenseEdge => Ok(InputParser::SonyDualSense {
             connection_mode: info.connection_mode,
         }),
+        InputBackend::DualShock4 | InputBackend::DualShock4V2 => Ok(InputParser::SonyDualShock4 {
+            connection_mode: info.connection_mode,
+        }),
         InputBackend::NintendoSwitchPro => Ok(InputParser::NintendoSwitch {
             connection_mode: info.connection_mode,
             generic: GenericHidParser::from_device(device)?,
         }),
-        InputBackend::DualShock4
-        | InputBackend::DualShock4V2
-        | InputBackend::GenericGamepad
-        | InputBackend::GenericJoystick => {
+        InputBackend::GenericGamepad | InputBackend::GenericJoystick => {
             Ok(InputParser::Generic(GenericHidParser::from_device(device)?))
         }
     }
@@ -467,7 +480,10 @@ fn build_input_parser(device: &HidDevice, info: &InputDeviceInfo) -> Result<Inpu
 
 fn initialize_input_device(device: &HidDevice, info: &InputDeviceInfo) -> Result<()> {
     if matches!(info.backend, Some(InputBackend::NintendoSwitchPro))
-        && matches!(info.connection_mode, ConnectionMode::Usb | ConnectionMode::Unknown)
+        && matches!(
+            info.connection_mode,
+            ConnectionMode::Usb | ConnectionMode::Unknown
+        )
     {
         initialize_switch_pro_usb(device)
             .context("failed to initialize Nintendo Switch Pro Controller over USB")?;
@@ -603,6 +619,35 @@ fn parse_dualsense_input_report(
     }
 }
 
+fn parse_dualshock4_input_report(
+    connection_mode: ConnectionMode,
+    report: &[u8],
+) -> Option<ControllerState> {
+    if report.is_empty() {
+        return None;
+    }
+
+    match report[0] {
+        0x11 => parse_dualshock4_bluetooth_input_report(report),
+        0x01 => match connection_mode {
+            ConnectionMode::Bluetooth => parse_dualshock4_compact_bluetooth_input_report(report)
+                .or_else(|| parse_dualshock4_usb_input_report(report)),
+            ConnectionMode::Usb => parse_dualshock4_usb_input_report(report)
+                .or_else(|| parse_dualshock4_compact_bluetooth_input_report(report)),
+            ConnectionMode::Unknown => {
+                if report.len() >= 64 {
+                    parse_dualshock4_usb_input_report(report)
+                        .or_else(|| parse_dualshock4_compact_bluetooth_input_report(report))
+                } else {
+                    parse_dualshock4_compact_bluetooth_input_report(report)
+                        .or_else(|| parse_dualshock4_usb_input_report(report))
+                }
+            }
+        },
+        _ => None,
+    }
+}
+
 fn parse_nintendo_switch_input_report(
     _connection_mode: ConnectionMode,
     generic: &GenericHidParser,
@@ -683,14 +728,36 @@ fn invert_switch_axis_byte(value: u8) -> u8 {
     255_u8.saturating_sub(value)
 }
 
+fn parse_dualshock4_usb_input_report(report: &[u8]) -> Option<ControllerState> {
+    if report.len() < 10 || report[0] != 0x01 {
+        return None;
+    }
+
+    Some(parse_common_layout(report, 1, 2, 3, 4, 8, 9, 5, 6, 7))
+}
+
+fn parse_dualshock4_bluetooth_input_report(report: &[u8]) -> Option<ControllerState> {
+    if report.len() < 12 || report[0] != 0x11 {
+        return None;
+    }
+
+    Some(parse_common_layout(report, 3, 4, 5, 6, 10, 11, 7, 8, 9))
+}
+
+fn parse_dualshock4_compact_bluetooth_input_report(report: &[u8]) -> Option<ControllerState> {
+    if report.len() < 10 || report[0] != 0x01 {
+        return None;
+    }
+
+    Some(parse_common_layout(report, 1, 2, 3, 4, 8, 9, 5, 6, 7))
+}
+
 fn parse_dualsense_usb_input_report(report: &[u8]) -> Option<ControllerState> {
     if report.len() < 11 || report[0] != 0x01 {
         return None;
     }
 
-    Some(parse_common_layout(
-        report, 1, 2, 3, 4, 5, 6, 8, 9, 10,
-    ))
+    Some(parse_common_layout(report, 1, 2, 3, 4, 5, 6, 8, 9, 10))
 }
 
 fn parse_dualsense_bluetooth_input_report(report: &[u8]) -> Option<ControllerState> {
@@ -698,9 +765,7 @@ fn parse_dualsense_bluetooth_input_report(report: &[u8]) -> Option<ControllerSta
         return None;
     }
 
-    Some(parse_common_layout(
-        report, 2, 3, 4, 5, 6, 7, 9, 10, 11,
-    ))
+    Some(parse_common_layout(report, 2, 3, 4, 5, 6, 7, 9, 10, 11))
 }
 
 fn parse_dualsense_compact_bluetooth_input_report(report: &[u8]) -> Option<ControllerState> {
@@ -708,9 +773,7 @@ fn parse_dualsense_compact_bluetooth_input_report(report: &[u8]) -> Option<Contr
         return None;
     }
 
-    Some(parse_common_layout(
-        report, 1, 2, 3, 4, 8, 9, 5, 6, 7,
-    ))
+    Some(parse_common_layout(report, 1, 2, 3, 4, 8, 9, 5, 6, 7))
 }
 
 fn parse_common_layout(
@@ -1371,14 +1434,80 @@ mod tests {
     }
 
     #[test]
+    fn parses_dualshock4_usb_report_with_native_layout() {
+        let report = [0x01, 0x12, 0x34, 0x56, 0x78, 0x28, 0x3C, 0x03, 0x9A, 0xBC];
+        let parsed = InputParser::SonyDualShock4 {
+            connection_mode: ConnectionMode::Usb,
+        }
+        .parse_report(&report)
+        .expect("dualshock 4 usb report should parse");
+
+        assert_eq!(parsed.left_stick.raw_x, 0x12);
+        assert_eq!(parsed.left_stick.raw_y, 0x34);
+        assert_eq!(parsed.right_stick.raw_x, 0x56);
+        assert_eq!(parsed.right_stick.raw_y, 0x78);
+        assert_eq!(parsed.l2, 0x9A);
+        assert_eq!(parsed.r2, 0xBC);
+        assert_eq!(parsed.dpad, DpadDirection::Neutral);
+        assert!(parsed.buttons.cross);
+        assert!(parsed.buttons.l2_button);
+        assert!(parsed.buttons.r2_button);
+        assert!(parsed.buttons.create);
+        assert!(parsed.buttons.options);
+        assert!(parsed.buttons.ps);
+        assert!(parsed.buttons.touchpad);
+    }
+
+    #[test]
+    fn parses_dualshock4_bluetooth_extended_report() {
+        let report = [
+            0x11, 0xAA, 0xBB, 0x81, 0x82, 0x83, 0x84, 0x46, 0x81, 0x00, 0x20, 0x40,
+        ];
+        let parsed = InputParser::SonyDualShock4 {
+            connection_mode: ConnectionMode::Bluetooth,
+        }
+        .parse_report(&report)
+        .expect("dualshock 4 bluetooth report should parse");
+
+        assert_eq!(parsed.left_stick.raw_x, 0x81);
+        assert_eq!(parsed.left_stick.raw_y, 0x82);
+        assert_eq!(parsed.right_stick.raw_x, 0x83);
+        assert_eq!(parsed.right_stick.raw_y, 0x84);
+        assert_eq!(parsed.l2, 0x20);
+        assert_eq!(parsed.r2, 0x40);
+        assert_eq!(parsed.dpad, DpadDirection::West);
+        assert!(parsed.buttons.circle);
+        assert!(parsed.buttons.l1);
+        assert!(parsed.buttons.r3);
+    }
+
+    #[test]
+    fn parses_dualshock4_compact_bluetooth_report() {
+        let report = [0x01, 0x90, 0x91, 0x92, 0x93, 0x18, 0x00, 0x00, 0x55, 0x66];
+        let parsed = InputParser::SonyDualShock4 {
+            connection_mode: ConnectionMode::Bluetooth,
+        }
+        .parse_report(&report)
+        .expect("dualshock 4 compact bluetooth report should parse");
+
+        assert_eq!(parsed.left_stick.raw_x, 0x90);
+        assert_eq!(parsed.left_stick.raw_y, 0x91);
+        assert_eq!(parsed.right_stick.raw_x, 0x92);
+        assert_eq!(parsed.right_stick.raw_y, 0x93);
+        assert_eq!(parsed.l2, 0x55);
+        assert_eq!(parsed.r2, 0x66);
+        assert_eq!(parsed.dpad, DpadDirection::Neutral);
+        assert!(parsed.buttons.square);
+    }
+
+    #[test]
     fn generic_layout_parses_axes_buttons_and_hat() {
         let descriptor = [
-            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
-            0x08, 0x95, 0x04, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34, 0x81,
-            0x02, 0x95, 0x02, 0x09, 0x32, 0x09, 0x35, 0x81, 0x02, 0x05, 0x01, 0x15,
-            0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x09, 0x39, 0x81, 0x42, 0x05,
-            0x09, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0A, 0x19, 0x01, 0x29,
-            0x0A, 0x81, 0x02, 0x75, 0x01, 0x95, 0x02, 0x81, 0x03, 0xC0,
+            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95,
+            0x04, 0x09, 0x30, 0x09, 0x31, 0x09, 0x33, 0x09, 0x34, 0x81, 0x02, 0x95, 0x02, 0x09,
+            0x32, 0x09, 0x35, 0x81, 0x02, 0x05, 0x01, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95,
+            0x01, 0x09, 0x39, 0x81, 0x42, 0x05, 0x09, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95,
+            0x0A, 0x19, 0x01, 0x29, 0x0A, 0x81, 0x02, 0x75, 0x01, 0x95, 0x02, 0x81, 0x03, 0xC0,
         ];
 
         let parsed = parse_report_descriptor(&descriptor).expect("descriptor should parse");
@@ -1410,10 +1539,10 @@ mod tests {
     #[test]
     fn generic_layout_accepts_report_id_prefixed_payloads() {
         let descriptor = [
-            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x15, 0x00, 0x26, 0xFF,
-            0x00, 0x75, 0x08, 0x95, 0x02, 0x09, 0x30, 0x09, 0x31, 0x81, 0x02, 0x05,
-            0x09, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x04, 0x19, 0x01, 0x29,
-            0x04, 0x81, 0x02, 0x75, 0x01, 0x95, 0x04, 0x81, 0x03, 0xC0,
+            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
+            0x08, 0x95, 0x02, 0x09, 0x30, 0x09, 0x31, 0x81, 0x02, 0x05, 0x09, 0x15, 0x00, 0x25,
+            0x01, 0x75, 0x01, 0x95, 0x04, 0x19, 0x01, 0x29, 0x04, 0x81, 0x02, 0x75, 0x01, 0x95,
+            0x04, 0x81, 0x03, 0xC0,
         ];
 
         let parsed = parse_report_descriptor(&descriptor).expect("descriptor should parse");
@@ -1521,7 +1650,9 @@ mod tests {
         let report = [
             0x30, 0x01, 0x91, 0x0F, 0x03, 0xCA, 0x00, 0x80, 0x80, 0x00, 0x80, 0x80,
         ];
-        let generic = GenericHidParser { layouts: Vec::new() };
+        let generic = GenericHidParser {
+            layouts: Vec::new(),
+        };
 
         let parsed = parse_nintendo_switch_input_report(ConnectionMode::Usb, &generic, &report)
             .expect("usb switch pro report should parse via the dedicated parser");

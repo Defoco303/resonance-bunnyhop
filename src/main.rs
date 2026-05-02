@@ -2,10 +2,13 @@
 
 mod app;
 mod assist;
+mod calibration;
 mod diagnostics;
 mod dualsense;
 mod runtime;
+mod settings;
 mod x360;
+mod xinput;
 
 use eframe::{egui, icon_data};
 
@@ -16,8 +19,8 @@ fn app_icon() -> egui::IconData {
 
 fn main() -> eframe::Result<()> {
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([400.0, 300.0])
-        .with_min_inner_size([340.0, 240.0])
+        .with_inner_size([442.0, 290.0])
+        .with_min_inner_size([408.0, 260.0])
         .with_resizable(true)
         .with_transparent(true)
         .with_icon(app_icon())

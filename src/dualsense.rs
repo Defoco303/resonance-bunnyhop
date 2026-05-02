@@ -1,8 +1,8 @@
 use std::{thread, time::Duration};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use hidapi::{DeviceInfo, HidApi, HidDevice, MAX_REPORT_DESCRIPTOR_SIZE};
-use hidparser::{parse_report_descriptor, ReportField, VariableField};
+use hidparser::{ReportField, VariableField, parse_report_descriptor};
 
 use crate::assist::{Buttons, ControllerState, DpadDirection, StickState};
 
@@ -37,6 +37,7 @@ pub enum InputBackend {
     DualShock4,
     DualShock4V2,
     NintendoSwitchPro,
+    XInput,
     GenericGamepad,
     GenericJoystick,
 }
@@ -48,6 +49,7 @@ impl InputBackend {
             Self::DualSenseEdge => "DualSense Edge",
             Self::DualShock4 | Self::DualShock4V2 => "DualShock 4",
             Self::NintendoSwitchPro => "Switch Pro Controller",
+            Self::XInput => "XInput Controller",
             Self::GenericGamepad => "Generic Gamepad",
             Self::GenericJoystick => "Generic Joystick",
         }
@@ -60,6 +62,7 @@ impl InputBackend {
             Self::DualShock4V2 => 4,
             Self::DualShock4 => 3,
             Self::NintendoSwitchPro => 3,
+            Self::XInput => 1,
             Self::GenericGamepad => 2,
             Self::GenericJoystick => 1,
         }
@@ -71,9 +74,25 @@ impl InputBackend {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSourceKind {
+    Hid,
+    XInput,
+}
+
+impl InputSourceKind {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Hid => 2,
+            Self::XInput => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionMode {
     Usb,
     Bluetooth,
+    XInput,
     Unknown,
 }
 
@@ -82,6 +101,7 @@ impl ConnectionMode {
         match self {
             Self::Usb => "USB",
             Self::Bluetooth => "Bluetooth",
+            Self::XInput => "XInput",
             Self::Unknown => "Unknown transport",
         }
     }
@@ -90,6 +110,7 @@ impl ConnectionMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputDeviceInfo {
     pub path: String,
+    pub source_kind: InputSourceKind,
     pub vendor_id: u16,
     pub product_id: u16,
     pub usage_page: u16,
@@ -106,6 +127,7 @@ impl InputDeviceInfo {
     fn from_hid(info: &DeviceInfo) -> Self {
         Self {
             path: info.path().to_string_lossy().into_owned(),
+            source_kind: InputSourceKind::Hid,
             vendor_id: info.vendor_id(),
             product_id: info.product_id(),
             usage_page: info.usage_page(),
@@ -125,12 +147,47 @@ impl InputDeviceInfo {
         }
     }
 
+    pub fn xinput(slot: u32, product: &str) -> Self {
+        Self {
+            path: format!("xinput:{slot}"),
+            source_kind: InputSourceKind::XInput,
+            vendor_id: 0,
+            product_id: 0,
+            usage_page: 0x01,
+            usage: 0x05,
+            interface_number: slot as i32,
+            serial_number: None,
+            manufacturer: "Microsoft XInput".to_owned(),
+            product: product.to_owned(),
+            backend: Some(InputBackend::XInput),
+            connection_mode: ConnectionMode::XInput,
+        }
+    }
+
     pub fn is_supported(&self) -> bool {
         self.backend.is_some()
     }
 
+    pub fn is_manual_selectable(&self) -> bool {
+        self.is_supported() && matches!(self.source_kind, InputSourceKind::Hid)
+    }
+
+    pub fn is_xinput(&self) -> bool {
+        matches!(self.source_kind, InputSourceKind::XInput)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn xinput_slot(&self) -> Option<u32> {
+        self.path.strip_prefix("xinput:")?.parse().ok()
+    }
+
+    pub fn transport_label(&self) -> &'static str {
+        self.connection_mode.label()
+    }
+
     pub fn backend_label(&self) -> String {
         match self.backend {
+            Some(InputBackend::XInput) => self.connection_mode.label().to_owned(),
             Some(backend) => format!("{} {}", backend.label(), self.connection_mode.label()),
             None => "Unsupported HID".to_owned(),
         }
@@ -138,6 +195,7 @@ impl InputDeviceInfo {
 
     pub fn product_label(&self) -> String {
         match self.backend {
+            Some(InputBackend::XInput) => self.product.clone(),
             Some(backend) if !backend.is_generic() && self.product.contains(backend.label()) => {
                 self.product.clone()
             }
@@ -148,7 +206,20 @@ impl InputDeviceInfo {
     }
 
     pub fn is_primary_input_interface(&self) -> bool {
-        self.usage_page == 0x01 && matches!(self.usage, 0x04 | 0x05)
+        matches!(self.source_kind, InputSourceKind::Hid)
+            && self.usage_page == 0x01
+            && matches!(self.usage, 0x04 | 0x05)
+    }
+
+    pub fn input_priority(&self) -> (bool, u8, u8, bool, bool, bool) {
+        (
+            self.is_supported(),
+            self.source_kind.priority(),
+            self.backend.map(InputBackend::priority).unwrap_or_default(),
+            self.is_primary_input_interface(),
+            self.usage == 0x05,
+            self.usage_page == 0x01,
+        )
     }
 }
 
@@ -299,16 +370,32 @@ fn should_list(info: &DeviceInfo) -> bool {
 }
 
 fn input_priority(info: &InputDeviceInfo) -> (bool, u8, bool, bool, bool) {
+    let (
+        supported,
+        _source_priority,
+        backend_priority,
+        primary_interface,
+        gamepad_usage,
+        usage_page,
+    ) = info.input_priority();
     (
-        info.is_supported(),
-        info.backend.map(InputBackend::priority).unwrap_or_default(),
-        info.is_primary_input_interface(),
-        info.usage == 0x05,
-        info.usage_page == 0x01,
+        supported,
+        backend_priority,
+        primary_interface,
+        gamepad_usage,
+        usage_page,
     )
 }
 
 fn sticky_match_score(candidate: &InputDeviceInfo, reference: &InputDeviceInfo) -> Option<u32> {
+    if candidate.source_kind != reference.source_kind {
+        return None;
+    }
+
+    if candidate.is_xinput() || reference.is_xinput() {
+        return (candidate.path == reference.path).then_some(400);
+    }
+
     if candidate.vendor_id != reference.vendor_id || candidate.product_id != reference.product_id {
         return None;
     }
@@ -472,6 +559,7 @@ fn build_input_parser(device: &HidDevice, info: &InputDeviceInfo) -> Result<Inpu
             connection_mode: info.connection_mode,
             generic: GenericHidParser::from_device(device)?,
         }),
+        InputBackend::XInput => bail!("XInput devices do not use HID parsers"),
         InputBackend::GenericGamepad | InputBackend::GenericJoystick => {
             Ok(InputParser::Generic(GenericHidParser::from_device(device)?))
         }
@@ -605,7 +693,7 @@ fn parse_dualsense_input_report(
                 .or_else(|| parse_dualsense_usb_input_report(report)),
             ConnectionMode::Usb => parse_dualsense_usb_input_report(report)
                 .or_else(|| parse_dualsense_compact_bluetooth_input_report(report)),
-            ConnectionMode::Unknown => {
+            ConnectionMode::XInput | ConnectionMode::Unknown => {
                 if report.len() >= 64 {
                     parse_dualsense_usb_input_report(report)
                         .or_else(|| parse_dualsense_compact_bluetooth_input_report(report))
@@ -634,7 +722,7 @@ fn parse_dualshock4_input_report(
                 .or_else(|| parse_dualshock4_usb_input_report(report)),
             ConnectionMode::Usb => parse_dualshock4_usb_input_report(report)
                 .or_else(|| parse_dualshock4_compact_bluetooth_input_report(report)),
-            ConnectionMode::Unknown => {
+            ConnectionMode::XInput | ConnectionMode::Unknown => {
                 if report.len() >= 64 {
                     parse_dualshock4_usb_input_report(report)
                         .or_else(|| parse_dualshock4_compact_bluetooth_input_report(report))
@@ -1291,6 +1379,7 @@ mod tests {
     fn usb_device(product_id: u16) -> InputDeviceInfo {
         InputDeviceInfo {
             path: "usb".to_owned(),
+            source_kind: InputSourceKind::Hid,
             vendor_id: SONY_VENDOR_ID,
             product_id,
             usage_page: 0x01,
@@ -1569,6 +1658,7 @@ mod tests {
     fn generic_devices_are_marked_supported() {
         let device = InputDeviceInfo {
             path: "generic".to_owned(),
+            source_kind: InputSourceKind::Hid,
             vendor_id: 0x1234,
             product_id: 0x5678,
             usage_page: 0x01,
@@ -1591,6 +1681,18 @@ mod tests {
         assert_eq!(device.connection_mode, ConnectionMode::Bluetooth);
         assert_eq!(device.backend, Some(InputBackend::DualShock4V2));
         assert_eq!(device.product_label(), "DualShock 4");
+    }
+
+    #[test]
+    fn xinput_devices_are_supported_but_not_manual_only() {
+        let device = InputDeviceInfo::xinput(1, "XInput Controller");
+
+        assert!(device.is_supported());
+        assert!(device.is_xinput());
+        assert!(!device.is_manual_selectable());
+        assert_eq!(device.backend_label(), "XInput");
+        assert_eq!(device.transport_label(), "XInput");
+        assert_eq!(device.xinput_slot(), Some(1));
     }
 
     #[test]

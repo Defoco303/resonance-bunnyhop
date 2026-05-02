@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssistPhase {
     Idle,
@@ -14,7 +16,7 @@ impl Default for AssistPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JumpButton {
     Circle,
     Cross,
@@ -35,54 +37,6 @@ pub enum JumpButton {
 impl Default for JumpButton {
     fn default() -> Self {
         Self::Circle
-    }
-}
-
-impl JumpButton {
-    pub const ALL: [Self; 14] = [
-        Self::Circle,
-        Self::Cross,
-        Self::Square,
-        Self::Triangle,
-        Self::L1,
-        Self::R1,
-        Self::L2Button,
-        Self::R2Button,
-        Self::L3,
-        Self::R3,
-        Self::Create,
-        Self::Options,
-        Self::Touchpad,
-        Self::Ps,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Circle => "Circle",
-            Self::Cross => "Cross",
-            Self::Square => "Square",
-            Self::Triangle => "Triangle",
-            Self::L1 => "L1",
-            Self::R1 => "R1",
-            Self::L2Button => "L2 click",
-            Self::R2Button => "R2 click",
-            Self::L3 => "L3",
-            Self::R3 => "R3",
-            Self::Create => "Create",
-            Self::Options => "Options",
-            Self::Touchpad => "Touchpad",
-            Self::Ps => "PS",
-        }
-    }
-
-    pub fn capture_mask(self) -> u32 {
-        1_u32 << (self as u32)
-    }
-
-    pub fn from_capture_mask(mask: u32) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|button| mask & button.capture_mask() != 0)
     }
 }
 
@@ -175,16 +129,6 @@ impl Buttons {
             JumpButton::Ps => self.ps,
         }
     }
-
-    pub fn capture_mask(self) -> u32 {
-        let mut mask = 0_u32;
-        for button in JumpButton::ALL {
-            if self.pressed(button) {
-                mask |= button.capture_mask();
-            }
-        }
-        mask
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,7 +202,8 @@ pub struct ControllerState {
     pub buttons: Buttons,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AssistConfig {
     pub jump_button: JumpButton,
     pub jump_overlap_ms: u64,
@@ -266,6 +211,8 @@ pub struct AssistConfig {
     pub retrigger_guard_ms: u64,
     pub movement_deadzone: f32,
     pub only_assist_while_moving: bool,
+    #[serde(default = "default_assist_enabled")]
+    pub assist_enabled: bool,
 }
 
 impl Default for AssistConfig {
@@ -277,8 +224,13 @@ impl Default for AssistConfig {
             retrigger_guard_ms: 8,
             movement_deadzone: 0.20,
             only_assist_while_moving: true,
+            assist_enabled: true,
         }
     }
+}
+
+const fn default_assist_enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -363,12 +315,23 @@ impl AssistEngine {
         config: AssistConfig,
         now: Instant,
     ) -> ControllerState {
+        if !config.assist_enabled {
+            self.sequence = None;
+            self.phase = AssistPhase::Idle;
+            self.last_sequence_age_ms = 0;
+            self.previous_jump_pressed = input.buttons.pressed(config.jump_button);
+            return input;
+        }
+
         let jump_pressed = input.buttons.pressed(config.jump_button);
         let movement_active = input.left_stick.is_moving(config.movement_deadzone);
         let assist_allowed = !config.only_assist_while_moving || movement_active;
         let rising_edge = jump_pressed && !self.previous_jump_pressed;
 
-        if self.sequence.is_some_and(|sequence| sequence.is_finished(now)) {
+        if self
+            .sequence
+            .is_some_and(|sequence| sequence.is_finished(now))
+        {
             self.sequence = None;
         }
 
@@ -419,6 +382,7 @@ mod tests {
             retrigger_guard_ms: 10,
             movement_deadzone: 0.1,
             only_assist_while_moving: true,
+            assist_enabled: true,
         };
         let base = Instant::now();
         let mut engine = AssistEngine::default();

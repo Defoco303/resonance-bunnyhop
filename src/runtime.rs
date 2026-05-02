@@ -12,10 +12,16 @@ use vigem_rust::{Client, TargetHandle};
 
 use crate::{
     assist::{AssistConfig, AssistEngine, AssistPhase, ControllerState, JumpButton},
+    calibration::{CalibrationStore, apply_device_calibration},
     diagnostics::{EnvironmentDiagnostics, collect_environment_diagnostics},
     dualsense::{InputDeviceInfo, InputParser, open_preferred_input_device, scan_input_devices},
     x360::map_to_x360_report,
+    xinput::scan_xinput_devices,
 };
+
+const ACTIVE_ASSIST_REPLAY_INTERVAL_MS: i32 = 2;
+const IDLE_INPUT_READ_TIMEOUT_MS: i32 = 8;
+const CONTROLLER_SCAN_RETRY_MS: u64 = 900;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceState {
@@ -95,6 +101,7 @@ pub struct SharedState {
     pub enabled: bool,
     pub preferred_device_path: Option<String>,
     pub config: AssistConfig,
+    pub calibrations: CalibrationStore,
     pub runtime: RuntimeSnapshot,
     pub shutdown: bool,
 }
@@ -105,6 +112,7 @@ impl Default for SharedState {
             enabled: false,
             preferred_device_path: None,
             config: AssistConfig::default(),
+            calibrations: CalibrationStore::default(),
             runtime: RuntimeSnapshot::default(),
             shutdown: false,
         }
@@ -128,6 +136,7 @@ struct BridgeEngine {
     client: Option<Client>,
     virtual_pad: Option<TargetHandle<Xbox360>>,
     assist: AssistEngine,
+    last_raw_input: Option<ControllerState>,
     last_input: Option<ControllerState>,
     last_output: Option<ControllerState>,
     next_controller_scan: Option<Instant>,
@@ -140,12 +149,13 @@ struct BridgeEngine {
 impl BridgeEngine {
     fn run(&mut self, shared: Arc<Mutex<SharedState>>) {
         loop {
-            let (enabled, preferred_device_path, config, shutdown) = {
+            let (enabled, preferred_device_path, config, calibrations, shutdown) = {
                 let state = shared.lock();
                 (
                     state.enabled,
                     state.preferred_device_path.clone(),
                     state.config,
+                    state.calibrations.clone(),
                     state.shutdown,
                 )
             };
@@ -175,7 +185,7 @@ impl BridgeEngine {
                 continue;
             }
 
-            if self.physical.is_none() {
+            if !self.has_active_controller() {
                 if let Err(error) = self.refresh_inventory_if_due(&shared) {
                     self.update_snapshot(&shared, |runtime| {
                         runtime.last_error = Some(error.to_string());
@@ -183,7 +193,7 @@ impl BridgeEngine {
                 }
             }
 
-            if let Err(error) = self.tick(config, &shared) {
+            if let Err(error) = self.tick(config, &calibrations, &shared) {
                 self.record_error(&shared, error);
                 thread::sleep(Duration::from_millis(120));
             }
@@ -197,10 +207,9 @@ impl BridgeEngine {
     ) {
         if self.preferred_device_path != preferred_device_path {
             self.preferred_device_path = preferred_device_path;
-            self.physical = None;
-            self.active_device = None;
-            self.active_parser = None;
+            self.clear_active_controller();
             self.device_hint = None;
+            self.last_raw_input = None;
             self.last_input = None;
             self.last_output = None;
             self.next_controller_scan = None;
@@ -212,18 +221,28 @@ impl BridgeEngine {
         }
     }
 
-    fn tick(&mut self, config: AssistConfig, shared: &Arc<Mutex<SharedState>>) -> Result<()> {
-        self.ensure_virtual_pad(shared)?;
+    fn tick(
+        &mut self,
+        config: AssistConfig,
+        calibrations: &CalibrationStore,
+        shared: &Arc<Mutex<SharedState>>,
+    ) -> Result<()> {
         self.ensure_controller(shared)?;
+        if !self.has_active_controller() {
+            return Ok(());
+        }
+        self.ensure_virtual_pad(shared)?;
 
         if self.physical.is_none() || self.active_device.is_none() || self.active_parser.is_none() {
             return Ok(());
         }
 
-        let mut report = [0_u8; 128];
-        self.active_device
-            .as_ref()
-            .context("controller metadata missing")?;
+        let assist_poll_active = self.assist.has_pending_sequence();
+        let initial_read_timeout_ms = if assist_poll_active {
+            ACTIVE_ASSIST_REPLAY_INTERVAL_MS
+        } else {
+            IDLE_INPUT_READ_TIMEOUT_MS
+        };
         let parser = self
             .active_parser
             .as_ref()
@@ -233,9 +252,11 @@ impl BridgeEngine {
             .as_ref()
             .context("controller disappeared unexpectedly")?;
         let mut latest_physical_state = None;
+        let mut report = [0_u8; 128];
+        let mut read_timeout_ms = initial_read_timeout_ms;
 
         loop {
-            let bytes = physical.read(&mut report)?;
+            let bytes = physical.read_timeout(&mut report, read_timeout_ms)?;
             if bytes == 0 {
                 break;
             }
@@ -243,16 +264,31 @@ impl BridgeEngine {
             if let Some(state) = parser.parse_report(&report[..bytes]) {
                 latest_physical_state = Some(state);
             }
+
+            read_timeout_ms = 0;
         }
 
         let now = Instant::now();
 
-        if let Some(physical_state) = latest_physical_state {
-            self.last_input = Some(physical_state);
-            self.publish_state(physical_state, config, shared, now)?;
-        } else if self.assist.has_pending_sequence() {
-            if let Some(physical_state) = self.last_input {
-                self.publish_state(physical_state, config, shared, now)?;
+        if let Some(raw_state) = latest_physical_state {
+            let input_state = self
+                .active_device
+                .as_ref()
+                .map(|device| apply_device_calibration(device, raw_state, calibrations))
+                .unwrap_or(raw_state);
+            self.last_raw_input = Some(raw_state);
+            self.last_input = Some(input_state);
+            self.publish_state(
+                raw_state,
+                input_state,
+                config,
+                shared,
+                now,
+                assist_poll_active,
+            )?;
+        } else if assist_poll_active {
+            if let (Some(raw_state), Some(input_state)) = (self.last_raw_input, self.last_input) {
+                self.publish_state(raw_state, input_state, config, shared, now, true)?;
             } else {
                 self.update_snapshot(shared, |runtime| {
                     runtime.service_state = ServiceState::Running;
@@ -271,13 +307,15 @@ impl BridgeEngine {
 
     fn publish_state(
         &mut self,
-        physical_state: ControllerState,
+        raw_state: ControllerState,
+        input_state: ControllerState,
         config: AssistConfig,
         shared: &Arc<Mutex<SharedState>>,
         now: Instant,
+        force_send: bool,
     ) -> Result<()> {
-        let output_state = self.assist.apply(physical_state, config, now);
-        if self.last_output != Some(output_state) {
+        let output_state = self.assist.apply(input_state, config, now);
+        if force_send || self.last_output != Some(output_state) {
             let report = map_to_x360_report(output_state);
             self.virtual_pad
                 .as_ref()
@@ -294,30 +332,66 @@ impl BridgeEngine {
             runtime.jump_count = self.assist.jump_count();
             runtime.last_sequence_age_ms = self.assist.last_sequence_age_ms();
             runtime.active_device = self.active_device.clone();
-            runtime.raw_state = physical_state;
-            runtime.raw_live = LiveView::from_state(physical_state, config.jump_button);
+            runtime.raw_state = raw_state;
+            runtime.raw_live = LiveView::from_state(raw_state, config.jump_button);
             runtime.assisted_live = LiveView::from_state(output_state, config.jump_button);
-            runtime.output_differs = physical_state != output_state;
+            runtime.output_differs = input_state != output_state;
             runtime.last_error = None;
         });
 
         Ok(())
     }
 
+    fn has_active_controller(&self) -> bool {
+        self.physical.is_some() && self.active_device.is_some() && self.active_parser.is_some()
+    }
+
+    fn clear_active_controller(&mut self) {
+        self.physical = None;
+        self.active_device = None;
+        self.active_parser = None;
+    }
+
+    fn activate_hid_controller(
+        &mut self,
+        device: HidDevice,
+        info: InputDeviceInfo,
+        parser: InputParser,
+        shared: &Arc<Mutex<SharedState>>,
+    ) -> Result<()> {
+        device.set_blocking_mode(false)?;
+        self.physical = Some(device);
+        self.active_device = Some(info.clone());
+        self.active_parser = Some(parser);
+        self.device_hint = Some(info.clone());
+        self.last_raw_input = None;
+        self.last_input = None;
+        self.next_controller_scan = None;
+        self.update_snapshot(shared, |runtime| {
+            runtime.service_state = ServiceState::Running;
+            runtime.physical_connected = true;
+            runtime.active_device = Some(info.clone());
+            runtime.last_error = None;
+        });
+        Ok(())
+    }
+
     fn ensure_controller(&mut self, shared: &Arc<Mutex<SharedState>>) -> Result<()> {
-        if self.physical.is_some() && self.active_device.is_some() && self.active_parser.is_some() {
+        if self.has_active_controller() {
             return Ok(());
         }
 
         if self.physical.is_some() || self.active_device.is_some() || self.active_parser.is_some() {
-            self.physical = None;
-            self.active_device = None;
-            self.active_parser = None;
+            self.clear_active_controller();
+            self.last_raw_input = None;
             self.last_input = None;
         }
 
         let now = Instant::now();
-        if self.next_controller_scan.is_some_and(|deadline| now < deadline) {
+        if self
+            .next_controller_scan
+            .is_some_and(|deadline| now < deadline)
+        {
             self.update_snapshot(shared, |runtime| {
                 runtime.service_state = ServiceState::Searching;
                 runtime.physical_connected = false;
@@ -333,29 +407,18 @@ impl BridgeEngine {
             self.device_hint.as_ref(),
         )? {
             Some((device, info, parser)) => {
-                device.set_blocking_mode(false)?;
-                self.physical = Some(device);
-                self.active_device = Some(info.clone());
-                self.active_parser = Some(parser);
-                self.device_hint = Some(info.clone());
-                self.last_input = None;
-                self.next_controller_scan = None;
-                self.update_snapshot(shared, |runtime| {
-                    runtime.service_state = ServiceState::Running;
-                    runtime.physical_connected = true;
-                    runtime.active_device = Some(info.clone());
-                    runtime.last_error = None;
-                });
-                Ok(())
+                self.activate_hid_controller(device, info, parser, shared)
             }
             None => {
                 self.active_device = None;
                 self.active_parser = None;
-                self.next_controller_scan = Some(now + Duration::from_millis(900));
+                self.next_controller_scan =
+                    Some(now + Duration::from_millis(CONTROLLER_SCAN_RETRY_MS));
                 self.update_snapshot(shared, |runtime| {
                     runtime.service_state = ServiceState::Searching;
                     runtime.physical_connected = false;
                     runtime.active_device = None;
+                    runtime.last_error = None;
                 });
                 thread::sleep(Duration::from_millis(50));
                 Ok(())
@@ -369,7 +432,10 @@ impl BridgeEngine {
         }
 
         let now = Instant::now();
-        if self.next_driver_retry.is_some_and(|deadline| now < deadline) {
+        if self
+            .next_driver_retry
+            .is_some_and(|deadline| now < deadline)
+        {
             self.update_snapshot(shared, |runtime| {
                 runtime.service_state = ServiceState::DriverMissing;
                 runtime.virtual_connected = false;
@@ -399,12 +465,23 @@ impl BridgeEngine {
 
     fn refresh_inventory_if_due(&mut self, shared: &Arc<Mutex<SharedState>>) -> Result<()> {
         let now = Instant::now();
-        if self.next_inventory_refresh.is_some_and(|deadline| now < deadline) {
+        if self
+            .next_inventory_refresh
+            .is_some_and(|deadline| now < deadline)
+        {
             return Ok(());
         }
 
         let api = self.hid_api.get_or_insert(HidApi::new()?);
-        let devices = scan_input_devices(api)?;
+        let mut devices = scan_input_devices(api)?;
+        devices.extend(scan_xinput_devices());
+        devices.sort_by(|a, b| {
+            a.input_priority()
+                .cmp(&b.input_priority())
+                .reverse()
+                .then_with(|| a.product_label().cmp(&b.product_label()))
+                .then_with(|| a.path.cmp(&b.path))
+        });
         self.next_inventory_refresh = Some(now + Duration::from_millis(1000));
 
         self.update_snapshot(shared, |runtime| {
@@ -434,11 +511,10 @@ impl BridgeEngine {
     }
 
     fn stop_bridge(&mut self, shared: &Arc<Mutex<SharedState>>) {
-        self.physical = None;
-        self.active_device = None;
-        self.active_parser = None;
+        self.clear_active_controller();
         self.virtual_pad = None;
         self.client = None;
+        self.last_raw_input = None;
         self.last_input = None;
         self.last_output = None;
         self.next_controller_scan = None;
@@ -474,9 +550,8 @@ impl BridgeEngine {
             return;
         }
 
-        self.physical = None;
-        self.active_device = None;
-        self.active_parser = None;
+        self.clear_active_controller();
+        self.last_raw_input = None;
         self.last_input = None;
         self.last_output = None;
         self.next_controller_scan = Some(Instant::now() + Duration::from_millis(700));
